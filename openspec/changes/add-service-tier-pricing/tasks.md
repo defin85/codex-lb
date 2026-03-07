@@ -1,7 +1,7 @@
 ## 1. Pricing rules
 
 - [x] 1.1 Add `gpt-5.4` pricing rules and aliases
-- [x] 1.2 Apply priority-tier pricing when `service_tier` indicates fast mode
+- [x] 1.2 Apply non-standard service-tier pricing when `service_tier` indicates priority/fast or flex mode
 
 ## 2. Cost accounting
 

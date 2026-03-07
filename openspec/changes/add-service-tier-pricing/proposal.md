@@ -5,7 +5,7 @@
 ## What Changes
 
 - add `gpt-5.4` pricing support, including the documented long-context standard tier rates
-- make fast-mode pricing depend on `service_tier` so priority requests are costed above standard requests
+- make service-tier pricing depend on forwarded `service_tier` values so priority requests are costed above standard requests and flex requests are costed below them
 - persist `service_tier` in request logs so historical cost summaries and trends remain correct
 - expose `service_tier` in request-log API responses so fast-mode requests are visible in the dashboard
 

@@ -1,11 +1,15 @@
 ## ADDED Requirements
 
 ### Requirement: Cost accounting uses model and service-tier pricing
-When computing API key `cost_usd` usage, the system MUST price requests using the resolved model pricing and the forwarded `service_tier` when present. Requests sent with fast mode (`service_tier: "priority"`) MUST use priority-tier pricing instead of standard-tier pricing.
+When computing API key `cost_usd` usage, the system MUST price requests using the resolved model pricing and the authoritative `service_tier` reported by the upstream response when available, falling back to the forwarded request `service_tier` only when the response omits it. Requests sent with non-standard service tiers MUST use the published pricing for the tier actually used instead of falling back to standard-tier pricing.
 
 #### Scenario: Priority-tier request increments cost limit
 - **WHEN** an authenticated request for a priced model is finalized with `service_tier: "priority"`
 - **THEN** the system computes `cost_usd` using the priority-tier rate for that model
+
+#### Scenario: Flex-tier request increments cost limit
+- **WHEN** an authenticated request for a priced model is finalized with `service_tier: "flex"`
+- **THEN** the system computes `cost_usd` using the flex-tier rate for that model
 
 #### Scenario: Standard-tier request keeps standard pricing
 - **WHEN** an authenticated request for the same model is finalized without `service_tier`
