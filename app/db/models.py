@@ -27,6 +27,10 @@ class Base(DeclarativeBase):
     pass
 
 
+def _enum_values(enum_cls: type[Enum]) -> list[str]:
+    return [str(member.value) for member in enum_cls]
+
+
 class AccountStatus(str, Enum):
     ACTIVE = "active"
     RATE_LIMITED = "rate_limited"
@@ -51,7 +55,12 @@ class Account(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     status: Mapped[AccountStatus] = mapped_column(
-        SqlEnum(AccountStatus, name="account_status", validate_strings=True),
+        SqlEnum(
+            AccountStatus,
+            name="account_status",
+            validate_strings=True,
+            values_callable=_enum_values,
+        ),
         default=AccountStatus.ACTIVE,
         nullable=False,
     )
@@ -196,11 +205,21 @@ class ApiKeyLimit(Base):
         nullable=False,
     )
     limit_type: Mapped[LimitType] = mapped_column(
-        SqlEnum(LimitType, name="limit_type", validate_strings=True),
+        SqlEnum(
+            LimitType,
+            name="limit_type",
+            validate_strings=True,
+            values_callable=_enum_values,
+        ),
         nullable=False,
     )
     limit_window: Mapped[LimitWindow] = mapped_column(
-        SqlEnum(LimitWindow, name="limit_window", validate_strings=True),
+        SqlEnum(
+            LimitWindow,
+            name="limit_window",
+            validate_strings=True,
+            values_callable=_enum_values,
+        ),
         nullable=False,
     )
     max_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
