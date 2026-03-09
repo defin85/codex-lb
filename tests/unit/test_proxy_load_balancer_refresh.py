@@ -93,19 +93,7 @@ class StubStickySessionsRepository:
 
 
 @pytest.mark.asyncio
-async def test_select_account_skips_latest_primary_requery_when_not_refreshed(monkeypatch) -> None:
-    async def stub_refresh_accounts(
-        self,
-        accounts: list[Account],
-        latest_usage: dict[str, UsageHistory],
-    ) -> bool:
-        return False
-
-    monkeypatch.setattr(
-        "app.modules.proxy.load_balancer.UsageUpdater.refresh_accounts",
-        stub_refresh_accounts,
-    )
-
+async def test_select_account_reads_cached_usage_once_per_window() -> None:
     account = _make_account("acc-load-balancer")
     now = utcnow()
     now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
@@ -130,6 +118,103 @@ async def test_select_account_skips_latest_primary_requery_when_not_refreshed(mo
 
     accounts_repo = StubAccountsRepository([account])
     usage_repo = StubUsageRepository(primary={account.id: primary_entry}, secondary={account.id: secondary_entry})
+    sticky_repo = StubStickySessionsRepository()
+
+    @asynccontextmanager
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield ProxyRepositories(
+            accounts=accounts_repo,  # type: ignore[arg-type]
+            usage=usage_repo,  # type: ignore[arg-type]
+            request_logs=object(),  # type: ignore[arg-type]
+            sticky_sessions=sticky_repo,  # type: ignore[arg-type]
+            api_keys=object(),  # type: ignore[arg-type]
+        )
+
+    balancer = LoadBalancer(repo_factory)
+    selection = await balancer.select_account()
+
+    assert selection.account is not None
+    assert selection.account.id == account.id
+    assert usage_repo.primary_calls == 1
+    assert usage_repo.secondary_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_select_account_uses_cached_usage_without_inline_refresh(monkeypatch) -> None:
+    async def fail_refresh_accounts(
+        self,
+        accounts: list[Account],
+        latest_usage: dict[str, UsageHistory],
+    ) -> bool:
+        raise AssertionError("select_account should not refresh usage inline")
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.UsageUpdater.refresh_accounts",
+        fail_refresh_accounts,
+    )
+
+    account = _make_account("acc-cached-selection")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary_entry = UsageHistory(
+        id=1,
+        account_id=account.id,
+        recorded_at=now,
+        window="primary",
+        used_percent=10.0,
+        reset_at=now_epoch + 300,
+        window_minutes=5,
+    )
+    secondary_entry = UsageHistory(
+        id=2,
+        account_id=account.id,
+        recorded_at=now,
+        window="secondary",
+        used_percent=15.0,
+        reset_at=now_epoch + 3600,
+        window_minutes=60,
+    )
+
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={account.id: primary_entry}, secondary={account.id: secondary_entry})
+    sticky_repo = StubStickySessionsRepository()
+
+    @asynccontextmanager
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield ProxyRepositories(
+            accounts=accounts_repo,  # type: ignore[arg-type]
+            usage=usage_repo,  # type: ignore[arg-type]
+            request_logs=object(),  # type: ignore[arg-type]
+            sticky_sessions=sticky_repo,  # type: ignore[arg-type]
+            api_keys=object(),  # type: ignore[arg-type]
+        )
+
+    balancer = LoadBalancer(repo_factory)
+    selection = await balancer.select_account()
+
+    assert selection.account is not None
+    assert selection.account.id == account.id
+    assert usage_repo.primary_calls == 1
+    assert usage_repo.secondary_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_select_account_proceeds_without_cached_usage_rows(monkeypatch) -> None:
+    async def fail_refresh_accounts(
+        self,
+        accounts: list[Account],
+        latest_usage: dict[str, UsageHistory],
+    ) -> bool:
+        raise AssertionError("select_account should not refresh usage inline")
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.UsageUpdater.refresh_accounts",
+        fail_refresh_accounts,
+    )
+
+    account = _make_account("acc-no-usage-yet")
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
     sticky_repo = StubStickySessionsRepository()
 
     @asynccontextmanager
@@ -207,18 +292,6 @@ async def test_select_account_prunes_stale_runtime_for_removed_accounts() -> Non
 
 @pytest.mark.asyncio
 async def test_round_robin_serializes_concurrent_selection(monkeypatch) -> None:
-    async def stub_refresh_accounts(
-        self,
-        accounts: list[Account],
-        latest_usage: dict[str, UsageHistory],
-    ) -> bool:
-        return False
-
-    monkeypatch.setattr(
-        "app.modules.proxy.load_balancer.UsageUpdater.refresh_accounts",
-        stub_refresh_accounts,
-    )
-
     now = utcnow()
     now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
     account_a = _make_account("acc-round-robin-a", "a@example.com")
@@ -310,18 +383,6 @@ async def test_round_robin_serializes_concurrent_selection(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_select_account_does_not_clobber_concurrent_error_state(monkeypatch) -> None:
-    async def stub_refresh_accounts(
-        self,
-        accounts: list[Account],
-        latest_usage: dict[str, UsageHistory],
-    ) -> bool:
-        return False
-
-    monkeypatch.setattr(
-        "app.modules.proxy.load_balancer.UsageUpdater.refresh_accounts",
-        stub_refresh_accounts,
-    )
-
     now = utcnow()
     now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
     account = _make_account("acc-runtime-race", "race@example.com")
