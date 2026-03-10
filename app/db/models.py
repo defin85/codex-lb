@@ -17,6 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
     false,
     func,
+    literal_column,
     text,
 )
 from sqlalchemy import Enum as SqlEnum
@@ -85,11 +86,25 @@ class UsageHistory(Base):
     credits_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class AdditionalUsageHistory(Base):
+    __tablename__ = "additional_usage_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    limit_name: Mapped[str] = mapped_column(String, nullable=False)
+    metered_feature: Mapped[str] = mapped_column(String, nullable=False)
+    window: Mapped[str] = mapped_column(String, nullable=False)
+    used_percent: Mapped[float] = mapped_column(Float, nullable=False)
+    reset_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    window_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class RequestLog(Base):
     __tablename__ = "request_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    account_id: Mapped[str] = mapped_column(String, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    account_id: Mapped[str | None] = mapped_column(String, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=True)
     api_key_id: Mapped[str | None] = mapped_column(String, nullable=True)
     request_id: Mapped[str] = mapped_column(String, nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -295,14 +310,40 @@ class ApiKeyUsageReservationItem(Base):
     limit: Mapped[ApiKeyLimit] = relationship("ApiKeyLimit")
 
 
+_PRIMARY_WINDOW_INDEX_EXPR = func.coalesce(UsageHistory.window, literal_column("'primary'"))
+
 Index("idx_usage_recorded_at", UsageHistory.recorded_at)
 Index("idx_usage_account_time", UsageHistory.account_id, UsageHistory.recorded_at)
+Index(
+    "idx_usage_window_account_latest",
+    _PRIMARY_WINDOW_INDEX_EXPR,
+    UsageHistory.account_id,
+    UsageHistory.recorded_at.desc(),
+    UsageHistory.id.desc(),
+)
 Index("idx_accounts_email", Account.email)
 Index("idx_logs_account_time", RequestLog.account_id, RequestLog.requested_at)
 Index("idx_logs_requested_at", RequestLog.requested_at)
+Index("idx_logs_requested_at_id", RequestLog.requested_at.desc(), RequestLog.id.desc())
 Index("idx_sticky_account", StickySession.account_id)
 Index("idx_api_keys_hash", ApiKey.key_hash)
 Index("idx_api_key_limits_key_id", ApiKeyLimit.api_key_id)
 Index("idx_api_key_usage_reservations_key_id", ApiKeyUsageReservation.api_key_id)
 Index("idx_api_key_usage_reservations_status", ApiKeyUsageReservation.status)
 Index("idx_api_key_usage_res_items_reservation_id", ApiKeyUsageReservationItem.reservation_id)
+Index("ix_additional_usage_history_account_id", AdditionalUsageHistory.account_id)
+Index("ix_additional_usage_history_recorded_at", AdditionalUsageHistory.recorded_at)
+Index(
+    "ix_additional_usage_history_composite",
+    AdditionalUsageHistory.account_id,
+    AdditionalUsageHistory.limit_name,
+    AdditionalUsageHistory.window,
+    AdditionalUsageHistory.recorded_at,
+)
+Index(
+    "ix_additional_usage_limit_window",
+    AdditionalUsageHistory.limit_name,
+    AdditionalUsageHistory.window,
+    AdditionalUsageHistory.account_id,
+    AdditionalUsageHistory.recorded_at,
+)

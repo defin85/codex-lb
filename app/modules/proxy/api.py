@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
+from typing import cast
 
 from fastapi import APIRouter, Body, Depends, File, Form, Request, Response, Security, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -31,6 +32,7 @@ from app.core.openai.models import (
 from app.core.openai.parsing import parse_response_payload
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesReasoning, ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
+from app.core.runtime_logging import log_error_response
 from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import parse_sse_data_json
@@ -121,13 +123,25 @@ async def v1_responses(
         responses_payload = payload.to_responses_request()
     except ClientPayloadError as exc:
         error = _openai_invalid_payload_error(exc.param)
-        return JSONResponse(status_code=400, content=error)
+        return _logged_error_json_response(request, 400, error)
     except ValidationError as exc:
         error = _openai_validation_error(exc)
-        return JSONResponse(status_code=400, content=error)
+        return _logged_error_json_response(request, 400, error)
     if responses_payload.stream:
-        return await _stream_responses(request, responses_payload, context, api_key)
-    return await _collect_responses(request, responses_payload, context, api_key)
+        return await _stream_responses(
+            request,
+            responses_payload,
+            context,
+            api_key,
+            openai_cache_affinity=True,
+        )
+    return await _collect_responses(
+        request,
+        responses_payload,
+        context,
+        api_key,
+        openai_cache_affinity=True,
+    )
 
 
 @router.get("/models", response_model=ModelListResponse)
@@ -171,7 +185,8 @@ async def v1_audio_transcriptions(
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> JSONResponse:
     if model != _TRANSCRIPTION_MODEL:
-        return JSONResponse(
+        return _logged_error_json_response(
+            request,
             status_code=400,
             content=_openai_invalid_transcription_model_error(model),
         )
@@ -269,10 +284,10 @@ async def v1_chat_completions(
         responses_payload = payload.to_responses_request()
     except ClientPayloadError as exc:
         error = _openai_invalid_payload_error(exc.param)
-        return JSONResponse(status_code=400, content=error, headers=rate_limit_headers)
+        return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
     except ValidationError as exc:
         error = _openai_validation_error(exc)
-        return JSONResponse(status_code=400, content=error, headers=rate_limit_headers)
+        return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=effective_model,
@@ -284,6 +299,7 @@ async def v1_chat_completions(
         responses_payload,
         request.headers,
         propagate_http_errors=True,
+        openai_cache_affinity=True,
         api_key=api_key,
         api_key_reservation=reservation,
         suppress_text_done_events=True,
@@ -293,7 +309,7 @@ async def v1_chat_completions(
     except StopAsyncIteration:
         first = None
     except ProxyResponseError as exc:
-        return JSONResponse(status_code=exc.status_code, content=exc.payload, headers=rate_limit_headers)
+        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
 
     stream_with_first = _prepend_first(first, stream)
     if payload.stream:
@@ -310,9 +326,10 @@ async def v1_chat_completions(
         error = result.error
         code = error.code if error else None
         status_code = 503 if code == "no_accounts" else 502
-        return JSONResponse(
+        return _logged_error_json_response(
+            request,
+            status_code,
             content=result.model_dump(mode="json", exclude_none=True),
-            status_code=status_code,
             headers=rate_limit_headers,
         )
     return JSONResponse(
@@ -329,6 +346,7 @@ async def _stream_responses(
     api_key: ApiKeyData | None,
     *,
     codex_session_affinity: bool = False,
+    openai_cache_affinity: bool = False,
     suppress_text_done_events: bool = False,
 ) -> Response:
     _apply_api_key_enforcement(payload, api_key)
@@ -346,6 +364,7 @@ async def _stream_responses(
         request.headers,
         codex_session_affinity=codex_session_affinity,
         propagate_http_errors=True,
+        openai_cache_affinity=openai_cache_affinity,
         api_key=api_key,
         api_key_reservation=reservation,
         suppress_text_done_events=suppress_text_done_events,
@@ -360,7 +379,7 @@ async def _stream_responses(
         )
     except ProxyResponseError as exc:
         await _release_reservation(reservation)
-        return JSONResponse(status_code=exc.status_code, content=exc.payload, headers=rate_limit_headers)
+        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
     return StreamingResponse(
         _prepend_first(first, stream),
         media_type="text/event-stream",
@@ -375,6 +394,7 @@ async def _collect_responses(
     api_key: ApiKeyData | None,
     *,
     codex_session_affinity: bool = False,
+    openai_cache_affinity: bool = False,
     suppress_text_done_events: bool = False,
 ) -> Response:
     _apply_api_key_enforcement(payload, api_key)
@@ -392,6 +412,7 @@ async def _collect_responses(
         request.headers,
         codex_session_affinity=codex_session_affinity,
         propagate_http_errors=True,
+        openai_cache_affinity=openai_cache_affinity,
         api_key=api_key,
         api_key_reservation=reservation,
         suppress_text_done_events=suppress_text_done_events,
@@ -401,18 +422,20 @@ async def _collect_responses(
     except ProxyResponseError as exc:
         await _release_reservation(reservation)
         error = _parse_error_envelope(exc.payload)
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=error.model_dump(mode="json", exclude_none=True),
+        return _logged_error_json_response(
+            request,
+            exc.status_code,
+            error.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
         )
     if isinstance(response_payload, OpenAIResponsePayload):
         if response_payload.status == "failed":
             error_payload = _error_envelope_from_response(response_payload.error)
             status_code = _status_for_error(error_payload.error)
-            return JSONResponse(
-                status_code=status_code,
-                content=error_payload.model_dump(mode="json", exclude_none=True),
+            return _logged_error_json_response(
+                request,
+                status_code,
+                error_payload.model_dump(mode="json", exclude_none=True),
                 headers=rate_limit_headers,
             )
         return JSONResponse(
@@ -420,9 +443,10 @@ async def _collect_responses(
             headers=rate_limit_headers,
         )
     status_code = _status_for_error(response_payload.error)
-    return JSONResponse(
-        status_code=status_code,
-        content=response_payload.model_dump(mode="json", exclude_none=True),
+    return _logged_error_json_response(
+        request,
+        status_code,
+        response_payload.model_dump(mode="json", exclude_none=True),
         headers=rate_limit_headers,
     )
 
@@ -448,11 +472,17 @@ async def v1_responses_compact(
         compact_payload = payload.to_compact_request()
     except ClientPayloadError as exc:
         error = _openai_invalid_payload_error(exc.param)
-        return JSONResponse(status_code=400, content=error)
+        return _logged_error_json_response(request, 400, error)
     except ValidationError as exc:
         error = _openai_validation_error(exc)
-        return JSONResponse(status_code=400, content=error)
-    return await _compact_responses(request, compact_payload, context, api_key)
+        return _logged_error_json_response(request, 400, error)
+    return await _compact_responses(
+        request,
+        compact_payload,
+        context,
+        api_key,
+        openai_cache_affinity=True,
+    )
 
 
 async def _compact_responses(
@@ -461,6 +491,7 @@ async def _compact_responses(
     context: ProxyContext,
     api_key: ApiKeyData | None,
     codex_session_affinity: bool = False,
+    openai_cache_affinity: bool = False,
 ) -> JSONResponse:
     _apply_api_key_enforcement(payload, api_key)
     _validate_model_access(api_key, payload.model)
@@ -476,6 +507,7 @@ async def _compact_responses(
             payload,
             request.headers,
             codex_session_affinity=codex_session_affinity,
+            openai_cache_affinity=openai_cache_affinity,
             api_key=api_key,
             api_key_reservation=reservation,
         )
@@ -487,16 +519,18 @@ async def _compact_responses(
                 code="not_implemented",
             )
         )
-        return JSONResponse(
-            status_code=501,
-            content=error.model_dump(mode="json", exclude_none=True),
+        return _logged_error_json_response(
+            request,
+            501,
+            error.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
         )
     except ProxyResponseError as exc:
         error = _parse_error_envelope(exc.payload)
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=error.model_dump(mode="json", exclude_none=True),
+        return _logged_error_json_response(
+            request,
+            exc.status_code,
+            error.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
         )
     finally:
@@ -530,12 +564,14 @@ async def _transcribe_request(
             content_type=file.content_type,
             prompt=prompt,
             headers=request.headers,
+            api_key=api_key,
         )
     except ProxyResponseError as exc:
         error = _parse_error_envelope(exc.payload)
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=error.model_dump(mode="json", exclude_none=True),
+        return _logged_error_json_response(
+            request,
+            exc.status_code,
+            error.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
         )
     finally:
@@ -561,6 +597,43 @@ async def _prepend_first(first: str | None, stream: AsyncIterator[str]) -> Async
 
 def _parse_sse_payload(line: str) -> dict[str, JsonValue] | None:
     return parse_sse_data_json(line)
+
+
+def _logged_error_json_response(
+    request: Request,
+    status_code: int,
+    content: object,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse:
+    code, message = _error_details_from_content(content)
+    log_error_response(
+        logger,
+        request,
+        status_code,
+        code,
+        message,
+        category="proxy_error_response",
+    )
+    return JSONResponse(status_code=status_code, content=content, headers=headers)
+
+
+def _error_details_from_content(content: object) -> tuple[str | None, str | None]:
+    if isinstance(content, OpenAIErrorEnvelopeModel):
+        error = content.error
+        if error is None:
+            return None, None
+        return error.code, error.message
+    if not isinstance(content, dict):
+        return None, None
+    content_dict = cast(dict[str, object], content)
+    error = content_dict.get("error")
+    if not isinstance(error, dict):
+        return None, None
+    error_dict = cast(dict[str, object], error)
+    code = error_dict.get("code")
+    message = error_dict.get("message")
+    return code if isinstance(code, str) else None, message if isinstance(message, str) else None
 
 
 async def _enforce_request_limits(

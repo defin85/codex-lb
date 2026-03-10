@@ -74,7 +74,7 @@ class LoadBalancer:
                             error_message=f"No accounts with a plan supporting model '{model}'",
                         )
                 latest_primary = await repos.usage.latest_by_account()
-                updater = UsageUpdater(repos.usage, repos.accounts)
+                updater = UsageUpdater(repos.usage, repos.accounts, repos.additional_usage)
                 refreshed = await updater.refresh_accounts(accounts, latest_primary)
                 if refreshed:
                     latest_primary = await repos.usage.latest_by_account()
@@ -181,6 +181,7 @@ class LoadBalancer:
                     [pinned],
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     routing_strategy=routing_strategy,
+                    allow_backoff_fallback=False,
                 )
                 if pinned_result.account is not None:
                     return pinned_result

@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from ipaddress import ip_network
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -50,9 +50,11 @@ class Settings(BaseSettings):
     database_migrate_on_startup: bool = True
     database_sqlite_pre_migrate_backup_enabled: bool = True
     database_sqlite_pre_migrate_backup_max_files: int = Field(default=5, ge=1)
+    database_sqlite_startup_check_mode: Literal["quick", "full", "off"] = "quick"
     database_alembic_auto_remap_enabled: bool = True
     upstream_base_url: str = "https://chatgpt.com/backend-api"
     upstream_connect_timeout_seconds: float = 30.0
+    upstream_compact_timeout_seconds: float | None = None
     stream_idle_timeout_seconds: float = 300.0
     max_sse_event_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
     auth_base_url: str = "https://auth.openai.com"
@@ -74,6 +76,8 @@ class Settings(BaseSettings):
     log_proxy_request_shape_raw_cache_key: bool = False
     log_proxy_request_payload: bool = False
     log_proxy_service_tier_trace: bool = False
+    log_upstream_request_summary: bool = False
+    log_upstream_request_payload: bool = False
     max_decompressed_body_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     image_inline_fetch_enabled: bool = True
     image_inline_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
@@ -146,6 +150,15 @@ class Settings(BaseSettings):
             except ValueError as exc:
                 raise ValueError(f"Invalid firewall trusted proxy CIDR: {cidr}") from exc
         return cidrs
+
+    @field_validator("upstream_compact_timeout_seconds")
+    @classmethod
+    def _validate_upstream_compact_timeout_seconds(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("upstream_compact_timeout_seconds must be greater than zero")
+        return value
 
 
 @lru_cache(maxsize=1)

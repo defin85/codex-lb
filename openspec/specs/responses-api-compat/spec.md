@@ -66,6 +66,17 @@ When `stream` is `false` or omitted, the service MUST return a JSON response obj
 - **WHEN** the client sends a valid request with `stream=false`
 - **THEN** the service returns a single JSON response object containing output items and status
 
+### Requirement: Reconstruct non-streaming Responses output from streamed item events
+When serving non-streaming `/v1/responses`, the service MUST preserve output items emitted on upstream SSE item events even when the terminal `response.completed` or `response.incomplete` payload omits `response.output` or returns it as an empty list.
+
+#### Scenario: Reasoning item emitted before terminal response
+- **WHEN** upstream emits a reasoning or other output item on `response.output_item.done` and the terminal response omits `output`
+- **THEN** the final non-streaming JSON response includes that output item in `output`
+
+#### Scenario: Terminal response already includes output
+- **WHEN** the terminal response already includes a non-empty `output` array
+- **THEN** the service returns the terminal `output` array unchanged
+
 ### Requirement: Error envelope parity for invalid or unsupported requests
 For invalid inputs or unsupported features, the service MUST return an OpenAI-style error envelope (`{ "error": { ... } }`) with stable `type`, `code`, and `param` fields. For streaming requests, errors MUST be emitted as `response.failed` events containing the same error envelope.
 
@@ -94,6 +105,13 @@ The service MUST accept Responses requests that include tools with type `web_sea
 #### Scenario: unsupported built-in tool rejected
 - **WHEN** the client sends `tools=[{"type":"code_interpreter"}]`
 - **THEN** the service returns a 4xx response with an OpenAI invalid_request_error indicating the unsupported tool type
+
+### Requirement: Preserve supported service_tier values
+When a Responses request includes `service_tier`, the service MUST preserve that field in the normalized upstream payload instead of dropping or rewriting it locally.
+
+#### Scenario: Responses request includes fast-mode tier
+- **WHEN** a client sends a valid Responses request with `service_tier: "priority"`
+- **THEN** the service accepts the request and forwards `service_tier: "priority"` upstream unchanged
 
 ### Requirement: Inline input_image URLs when possible
 When a request includes `input_image` parts with HTTP(S) URLs, the service MUST attempt to fetch the image and replace the URL with a data URL if the image is within size limits. If the image cannot be fetched or exceeds size limits, the service MUST preserve the original URL and allow upstream to handle the error.
@@ -139,7 +157,7 @@ Before forwarding Responses payloads upstream, the service MUST remove `safety_i
 - **THEN** the mapped Responses payload forwarded upstream excludes `safety_identifier`
 
 ### Requirement: Strip known unsupported advisory parameters before upstream forwarding
-Before forwarding Responses payloads upstream, the service MUST remove known unsupported advisory parameters that upstream rejects with `unknown_parameter`. At minimum, the service MUST strip `prompt_cache_retention` and `temperature` from normalized payloads for both standard and compact Responses endpoints.
+Before forwarding Responses payloads upstream, the service MUST remove known unsupported advisory parameters that upstream rejects with `unknown_parameter`. At minimum, the service MUST strip `prompt_cache_retention` and `temperature` from normalized payloads for both standard and compact Responses endpoints, and MUST preserve `prompt_cache_key`.
 
 #### Scenario: prompt_cache_retention provided
 - **WHEN** a client sends a valid Responses request that includes `prompt_cache_retention`
@@ -152,6 +170,24 @@ Before forwarding Responses payloads upstream, the service MUST remove known uns
 #### Scenario: unrelated extra field provided
 - **WHEN** a client sends a valid request with an unrelated extra field not in the unsupported list
 - **THEN** the service preserves that field in forwarded payload
+
+### Requirement: Use prompt_cache_key as OpenAI cache affinity
+For OpenAI-style `/v1/responses` and `/v1/responses/compact` requests, the service MUST treat a non-empty `prompt_cache_key` as the upstream account affinity key for prompt-cache correctness. This affinity MUST apply even when dashboard `sticky_threads_enabled` is disabled, and the service MUST continue forwarding the same `prompt_cache_key` upstream unchanged.
+
+#### Scenario: /v1 responses request pins account with prompt_cache_key
+- **WHEN** a client sends repeated `/v1/responses` requests with the same non-empty `prompt_cache_key` while `sticky_threads_enabled` is disabled
+- **THEN** the service selects the same upstream account for those requests
+
+#### Scenario: /v1 compact request reuses prompt-cache affinity
+- **WHEN** a client sends `/v1/responses/compact` after `/v1/responses` with the same non-empty `prompt_cache_key` while `sticky_threads_enabled` is disabled
+- **THEN** the compact request reuses the previously selected upstream account
+
+### Requirement: Normalize prompt cache aliases for upstream compatibility
+Before forwarding Responses payloads upstream, the service MUST normalize OpenAI-compatible camelCase prompt cache controls so codex-lb applies compatibility behavior consistently. The service MUST forward `promptCacheKey` as `prompt_cache_key`, and MUST treat `promptCacheRetention` the same as `prompt_cache_retention` for stripping behavior.
+
+#### Scenario: camelCase prompt cache fields provided
+- **WHEN** a client sends `promptCacheKey` or `promptCacheRetention` on a valid Responses request
+- **THEN** the service forwards `prompt_cache_key` with the same value and does not forward `prompt_cache_retention`
 
 ### Requirement: Sanitize unsupported interleaved and legacy chat input fields
 Before forwarding Responses requests upstream, the service MUST remove unsupported interleaved reasoning and legacy chat fields from `input` items and content parts. The service MUST strip `reasoning_content`, `reasoning_details`, `tool_calls`, and `function_call` fields when they appear in `input` structures, and MUST remove unsupported reasoning-only content parts that are not accepted by upstream.
@@ -213,3 +249,18 @@ When a backend Codex Responses or compact request includes a non-empty `session_
 #### Scenario: Compact request reuses pinned Codex session account
 - **WHEN** `/backend-api/codex/responses/compact` is called with the same non-empty `session_id` header after routing preferences change
 - **THEN** the service reuses the previously pinned upstream account for that thread instead of reallocating to a different account
+
+#### Scenario: Compact retry uses refreshed provider account identity
+- **WHEN** a pinned backend Codex compact request gets a `401` from upstream, refreshes the selected account, and retries
+- **THEN** the retry forwards the refreshed account's `chatgpt-account-id` header instead of reusing the pre-refresh account header
+
+### Requirement: Compact upstream timeout matches Codex CLI by default
+The service MUST not impose a compact request timeout by default for `/responses/compact` requests. The service MAY allow operators to configure an explicit compact timeout override, and upstream read timeouts on compact MUST surface as `502` OpenAI-format errors with code `upstream_unavailable`.
+
+#### Scenario: Compact request exceeds read timeout
+- **WHEN** an upstream compact request does not produce a complete JSON response before the configured compact timeout elapses
+- **THEN** the service returns `502` with error code `upstream_unavailable`
+
+#### Scenario: Compact request uses no timeout by default
+- **WHEN** `/responses/compact` is called and no compact timeout override is configured
+- **THEN** the service forwards the request without setting an upstream total or read timeout

@@ -12,7 +12,7 @@ import anyio
 
 from app.core import usage as usage_core
 from app.core.auth.refresh import RefreshError
-from app.core.balancer import PERMANENT_FAILURE_CODES
+from app.core.balancer import PERMANENT_FAILURE_CODES, RoutingStrategy
 from app.core.balancer.types import UpstreamError
 from app.core.clients.proxy import ProxyResponseError, filter_inbound_headers
 from app.core.clients.proxy import compact_responses as core_compact_responses
@@ -50,7 +50,12 @@ from app.modules.proxy.helpers import (
 from app.modules.proxy.load_balancer import LoadBalancer
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories
-from app.modules.proxy.types import RateLimitStatusPayloadData
+from app.modules.proxy.types import (
+    AdditionalRateLimitData,
+    RateLimitStatusDetailsData,
+    RateLimitStatusPayloadData,
+    RateLimitWindowSnapshotData,
+)
 from app.modules.usage.updater import UsageUpdater
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,7 @@ class ProxyService:
         *,
         codex_session_affinity: bool = False,
         propagate_http_errors: bool = False,
+        openai_cache_affinity: bool = False,
         api_key: ApiKeyData | None = None,
         api_key_reservation: ApiKeyUsageReservationData | None = None,
         suppress_text_done_events: bool = False,
@@ -84,6 +90,7 @@ class ProxyService:
             filtered,
             codex_session_affinity=codex_session_affinity,
             propagate_http_errors=propagate_http_errors,
+            openai_cache_affinity=openai_cache_affinity,
             api_key=api_key,
             api_key_reservation=api_key_reservation,
             suppress_text_done_events=suppress_text_done_events,
@@ -95,77 +102,59 @@ class ProxyService:
         headers: Mapping[str, str],
         *,
         codex_session_affinity: bool = False,
+        openai_cache_affinity: bool = False,
         api_key: ApiKeyData | None = None,
         api_key_reservation: ApiKeyUsageReservationData | None = None,
     ) -> OpenAIResponsePayload:
         _maybe_log_proxy_request_payload("compact", payload, headers)
         _maybe_log_proxy_request_shape("compact", payload, headers)
         filtered = filter_inbound_headers(headers)
-        ensure_request_id()
+        request_id = get_request_id() or ensure_request_id(None)
+        start = time.monotonic()
+        account_id_value: str | None = None
+        log_status = "error"
+        log_error_code: str | None = None
+        log_error_message: str | None = None
+        response: OpenAIResponsePayload | None = None
+        request_service_tier: str | None = None
+        actual_service_tier: str | None = None
+
         settings = await get_settings_cache().get()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
         sticky_threads_enabled = settings.sticky_threads_enabled
-        routing_strategy = getattr(settings, "routing_strategy", "usage_weighted")
+        routing_strategy = _routing_strategy(settings)
         sticky_key, reallocate_sticky = _sticky_key_for_compact_request(
             payload,
             headers,
             codex_session_affinity=codex_session_affinity,
+            openai_cache_affinity=openai_cache_affinity,
             sticky_threads_enabled=sticky_threads_enabled,
         )
-        selection = await self._load_balancer.select_account(
-            sticky_key=sticky_key,
-            reallocate_sticky=reallocate_sticky,
-            prefer_earlier_reset_accounts=prefer_earlier_reset,
-            routing_strategy=routing_strategy,
-            model=payload.model,
-        )
-        account = selection.account
-        if not account:
-            raise ProxyResponseError(
-                503,
-                openai_error("no_accounts", selection.error_message or "No active accounts available"),
-            )
-        account = await self._ensure_fresh(account)
-        account_id = _header_account_id(account.chatgpt_account_id)
-        request_service_tier = _service_tier_from_compact_payload(payload)
-        actual_service_tier: str | None = None
-
-        async def _call_compact(target: Account) -> OpenAIResponsePayload:
-            access_token = self._encryptor.decrypt(target.access_token_encrypted)
-            return await core_compact_responses(payload, filtered, access_token, account_id)
-
         try:
-            response = await _call_compact(account)
-            actual_service_tier = _service_tier_from_response(response)
-            await self._settle_compact_api_key_usage(
-                api_key=api_key,
-                api_key_reservation=api_key_reservation,
-                response=response,
-                request_service_tier=request_service_tier,
+            selection = await self._load_balancer.select_account(
+                sticky_key=sticky_key,
+                reallocate_sticky=reallocate_sticky,
+                prefer_earlier_reset_accounts=prefer_earlier_reset,
+                routing_strategy=routing_strategy,
+                model=payload.model,
             )
-            return response
-        except ProxyResponseError as exc:
-            if exc.status_code != 401:
-                await self._settle_compact_api_key_usage(
-                    api_key=api_key,
-                    api_key_reservation=api_key_reservation,
-                    response=None,
-                    request_service_tier=request_service_tier,
+            account = selection.account
+            if not account:
+                log_error_code = "no_accounts"
+                log_error_message = selection.error_message or "No active accounts available"
+                raise ProxyResponseError(
+                    503,
+                    openai_error("no_accounts", log_error_message),
                 )
-                await self._handle_proxy_error(account, exc)
-                raise
-            try:
-                account = await self._ensure_fresh(account, force=True)
-            except RefreshError as refresh_exc:
-                if refresh_exc.is_permanent:
-                    await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
-                await self._settle_compact_api_key_usage(
-                    api_key=api_key,
-                    api_key_reservation=api_key_reservation,
-                    response=None,
-                    request_service_tier=request_service_tier,
-                )
-                raise exc
+            account_id_value = account.id
+            account = await self._ensure_fresh(account)
+            request_service_tier = _service_tier_from_compact_payload(payload)
+
+            async def _call_compact(target: Account) -> OpenAIResponsePayload:
+                access_token = self._encryptor.decrypt(target.access_token_encrypted)
+                account_id = _header_account_id(target.chatgpt_account_id)
+                return await core_compact_responses(payload, filtered, access_token, account_id)
+
             try:
                 response = await _call_compact(account)
                 actual_service_tier = _service_tier_from_response(response)
@@ -175,17 +164,80 @@ class ProxyService:
                     response=response,
                     request_service_tier=request_service_tier,
                 )
+                log_status = "success"
                 return response
             except ProxyResponseError as exc:
-                await self._settle_compact_api_key_usage(
-                    api_key=api_key,
-                    api_key_reservation=api_key_reservation,
-                    response=None,
-                    request_service_tier=request_service_tier,
-                )
-                await self._handle_proxy_error(account, exc)
-                raise
+                if exc.status_code != 401:
+                    await self._settle_compact_api_key_usage(
+                        api_key=api_key,
+                        api_key_reservation=api_key_reservation,
+                        response=None,
+                        request_service_tier=request_service_tier,
+                    )
+                    await self._handle_proxy_error(account, exc)
+                    raise
+                try:
+                    account = await self._ensure_fresh(account, force=True)
+                except RefreshError as refresh_exc:
+                    if refresh_exc.is_permanent:
+                        await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
+                    await self._settle_compact_api_key_usage(
+                        api_key=api_key,
+                        api_key_reservation=api_key_reservation,
+                        response=None,
+                        request_service_tier=request_service_tier,
+                    )
+                    raise exc
+                try:
+                    response = await _call_compact(account)
+                    await self._settle_compact_api_key_usage(
+                        api_key=api_key,
+                        api_key_reservation=api_key_reservation,
+                        response=response,
+                        request_service_tier=request_service_tier,
+                    )
+                    log_status = "success"
+                    return response
+                except ProxyResponseError as exc:
+                    await self._settle_compact_api_key_usage(
+                        api_key=api_key,
+                        api_key_reservation=api_key_reservation,
+                        response=None,
+                        request_service_tier=request_service_tier,
+                    )
+                    await self._handle_proxy_error(account, exc)
+                    raise
+        except ProxyResponseError as exc:
+            error = _parse_openai_error(exc.payload)
+            log_error_code = log_error_code or _normalize_error_code(
+                error.code if error else None,
+                error.type if error else None,
+            )
+            log_error_message = log_error_message or (error.message if error else None)
+            raise
         finally:
+            usage = response.usage if response else None
+            reasoning_effort = payload.reasoning.effort if payload.reasoning else None
+            await self._write_request_log(
+                account_id=account_id_value,
+                api_key=api_key,
+                request_id=request_id,
+                model=payload.model,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status=log_status,
+                error_code=log_error_code,
+                error_message=log_error_message,
+                input_tokens=usage.input_tokens if usage else None,
+                output_tokens=usage.output_tokens if usage else None,
+                cached_input_tokens=(
+                    usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
+                ),
+                reasoning_tokens=(
+                    usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
+                ),
+                reasoning_effort=reasoning_effort,
+                service_tier=_service_tier_from_response(response) or _service_tier_from_compact_payload(payload),
+            )
             _maybe_log_proxy_service_tier_trace(
                 "compact",
                 requested_service_tier=request_service_tier,
@@ -200,65 +252,101 @@ class ProxyService:
         content_type: str | None,
         prompt: str | None,
         headers: Mapping[str, str],
+        api_key: ApiKeyData | None = None,
     ) -> dict[str, JsonValue]:
         filtered = filter_inbound_headers(headers)
+        request_id = get_request_id() or ensure_request_id(None)
+        start = time.monotonic()
+        account_id_value: str | None = None
+        log_status = "error"
+        log_error_code: str | None = None
+        log_error_message: str | None = None
+        transcribe_model = "gpt-4o-transcribe"
+
         settings = await get_settings_cache().get()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
-        routing_strategy = getattr(settings, "routing_strategy", "usage_weighted")
-        selection = await self._load_balancer.select_account(
-            prefer_earlier_reset_accounts=prefer_earlier_reset,
-            routing_strategy=routing_strategy,
-            model=None,
-        )
-        account = selection.account
-        if not account:
-            raise ProxyResponseError(
-                503,
-                openai_error("no_accounts", selection.error_message or "No active accounts available"),
-            )
-
-        async def _call_transcribe(target: Account) -> dict[str, JsonValue]:
-            access_token = self._encryptor.decrypt(target.access_token_encrypted)
-            account_id = _header_account_id(target.chatgpt_account_id)
-            return await core_transcribe_audio(
-                audio_bytes,
-                filename=filename,
-                content_type=content_type,
-                prompt=prompt,
-                headers=filtered,
-                access_token=access_token,
-                account_id=account_id,
-            )
-
+        routing_strategy = _routing_strategy(settings)
         try:
-            account = await self._ensure_fresh(account)
-            return await _call_transcribe(account)
-        except RefreshError as refresh_exc:
-            if refresh_exc.is_permanent:
-                await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
-            raise ProxyResponseError(
-                401,
-                openai_error(
-                    "invalid_api_key",
-                    refresh_exc.message,
-                    error_type="invalid_request_error",
-                ),
-            ) from refresh_exc
-        except ProxyResponseError as exc:
-            if exc.status_code != 401:
-                await self._handle_proxy_error(account, exc)
-                raise
+            selection = await self._load_balancer.select_account(
+                prefer_earlier_reset_accounts=prefer_earlier_reset,
+                routing_strategy=routing_strategy,
+                model=None,
+            )
+            account = selection.account
+            if not account:
+                log_error_code = "no_accounts"
+                log_error_message = selection.error_message or "No active accounts available"
+                raise ProxyResponseError(
+                    503,
+                    openai_error("no_accounts", log_error_message),
+                )
+            account_id_value = account.id
+
+            async def _call_transcribe(target: Account) -> dict[str, JsonValue]:
+                access_token = self._encryptor.decrypt(target.access_token_encrypted)
+                account_id = _header_account_id(target.chatgpt_account_id)
+                return await core_transcribe_audio(
+                    audio_bytes,
+                    filename=filename,
+                    content_type=content_type,
+                    prompt=prompt,
+                    headers=filtered,
+                    access_token=access_token,
+                    account_id=account_id,
+                )
+
             try:
-                account = await self._ensure_fresh(account, force=True)
+                account = await self._ensure_fresh(account)
+                result = await _call_transcribe(account)
+                log_status = "success"
+                return result
             except RefreshError as refresh_exc:
                 if refresh_exc.is_permanent:
                     await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
-                raise exc
-            try:
-                return await _call_transcribe(account)
+                raise ProxyResponseError(
+                    401,
+                    openai_error(
+                        "invalid_api_key",
+                        refresh_exc.message,
+                        error_type="invalid_request_error",
+                    ),
+                ) from refresh_exc
             except ProxyResponseError as exc:
-                await self._handle_proxy_error(account, exc)
-                raise
+                if exc.status_code != 401:
+                    await self._handle_proxy_error(account, exc)
+                    raise
+                try:
+                    account = await self._ensure_fresh(account, force=True)
+                except RefreshError as refresh_exc:
+                    if refresh_exc.is_permanent:
+                        await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
+                    raise exc
+                try:
+                    result = await _call_transcribe(account)
+                    log_status = "success"
+                    return result
+                except ProxyResponseError as exc:
+                    await self._handle_proxy_error(account, exc)
+                    raise
+        except ProxyResponseError as exc:
+            error = _parse_openai_error(exc.payload)
+            log_error_code = log_error_code or _normalize_error_code(
+                error.code if error else None,
+                error.type if error else None,
+            )
+            log_error_message = log_error_message or (error.message if error else None)
+            raise
+        finally:
+            await self._write_request_log(
+                account_id=account_id_value,
+                api_key=api_key,
+                request_id=request_id,
+                model=transcribe_model,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status=log_status,
+                error_code=log_error_code,
+                error_message=log_error_message,
+            )
 
     async def _settle_compact_api_key_usage(
         self,
@@ -408,10 +496,14 @@ class ProxyService:
             primary_window = _window_snapshot(primary_summary, primary_rows, "primary", now_epoch)
             secondary_window = _window_snapshot(secondary_summary, secondary_rows, "secondary", now_epoch)
 
+            # Fetch additional rate limits
+            additional_rate_limits = await self._build_additional_rate_limits(repos, account_map, now_epoch)
+
             return RateLimitStatusPayloadData(
                 plan_type=_plan_type_for_accounts(selected_accounts),
                 rate_limit=_rate_limit_details(primary_window, secondary_window),
                 credits=_credits_snapshot(await self._latest_usage_entries(repos, account_map)),
+                additional_rate_limits=additional_rate_limits,
             )
 
     async def _stream_with_retry(
@@ -421,23 +513,27 @@ class ProxyService:
         *,
         codex_session_affinity: bool,
         propagate_http_errors: bool,
+        openai_cache_affinity: bool,
         api_key: ApiKeyData | None,
         api_key_reservation: ApiKeyUsageReservationData | None,
         suppress_text_done_events: bool,
     ) -> AsyncIterator[str]:
         request_id = ensure_request_id()
+        start = time.monotonic()
         settings = await get_settings_cache().get()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
         sticky_threads_enabled = settings.sticky_threads_enabled
-        routing_strategy = getattr(settings, "routing_strategy", "usage_weighted")
+        routing_strategy = _routing_strategy(settings)
         sticky_key = _sticky_key_for_responses_request(
             payload,
             headers,
             codex_session_affinity=codex_session_affinity,
+            openai_cache_affinity=openai_cache_affinity,
             sticky_threads_enabled=sticky_threads_enabled,
         )
         max_attempts = 3
         settled = False
+        any_attempt_logged = False
         settlement = _StreamSettlement()
         try:
             for attempt in range(max_attempts):
@@ -449,17 +545,31 @@ class ProxyService:
                 )
                 account = selection.account
                 if not account:
+                    no_accounts_msg = selection.error_message or "No active accounts available"
                     event = response_failed_event(
                         "no_accounts",
-                        selection.error_message or "No active accounts available",
+                        no_accounts_msg,
                         response_id=request_id,
                     )
                     yield format_sse_event(event)
+                    await self._write_request_log(
+                        account_id=None,
+                        api_key=api_key,
+                        request_id=request_id,
+                        model=payload.model,
+                        latency_ms=int((time.monotonic() - start) * 1000),
+                        status="error",
+                        error_code="no_accounts",
+                        error_message=no_accounts_msg,
+                        reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                        service_tier=payload.service_tier,
+                    )
                     return
 
                 account_id_value = account.id
                 try:
                     account = await self._ensure_fresh(account)
+                    any_attempt_logged = True
                     settlement = _StreamSettlement()
                     async for line in self._stream_once(
                         account,
@@ -553,12 +663,26 @@ class ProxyService:
                         )
                         yield format_sse_event(event)
                         return
+            retries_exhausted_msg = "No available accounts after retries"
             event = response_failed_event(
                 "no_accounts",
-                "No available accounts after retries",
+                retries_exhausted_msg,
                 response_id=request_id,
             )
             yield format_sse_event(event)
+            if not any_attempt_logged:
+                await self._write_request_log(
+                    account_id=None,
+                    api_key=api_key,
+                    request_id=request_id,
+                    model=payload.model,
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                    status="error",
+                    error_code="no_accounts",
+                    error_message=retries_exhausted_msg,
+                    reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                    service_tier=payload.service_tier,
+                )
         finally:
             if not settled and api_key is not None and api_key_reservation is not None:
                 with anyio.CancelScope(shield=True):
@@ -700,7 +824,6 @@ class ProxyService:
             error_message = error.message if error else None
             raise
         finally:
-            latency_ms = int((time.monotonic() - start) * 1000)
             input_tokens = usage.input_tokens if usage else None
             output_tokens = usage.output_tokens if usage else None
             cached_input_tokens = (
@@ -715,41 +838,76 @@ class ProxyService:
             settlement.input_tokens = input_tokens
             settlement.output_tokens = output_tokens
             settlement.cached_input_tokens = cached_input_tokens
-            with anyio.CancelScope(shield=True):
-                try:
-                    async with self._repo_factory() as repos:
-                        await repos.request_logs.add_log(
-                            account_id=account_id_value,
-                            api_key_id=api_key.id if api_key else None,
-                            request_id=request_id,
-                            model=model,
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                            cached_input_tokens=cached_input_tokens,
-                            reasoning_tokens=reasoning_tokens,
-                            reasoning_effort=reasoning_effort,
-                            service_tier=service_tier,
-                            latency_ms=latency_ms,
-                            status=status,
-                            error_code=error_code,
-                            error_message=error_message,
-                        )
-                except Exception:
-                    logger.warning(
-                        "Failed to persist request log account_id=%s request_id=%s",
-                        account_id_value,
-                        request_id,
-                        exc_info=True,
+            await self._write_request_log(
+                account_id=account_id_value,
+                api_key=api_key,
+                request_id=request_id,
+                model=model,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status=status,
+                error_code=error_code,
+                error_message=error_message,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                reasoning_tokens=reasoning_tokens,
+                reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
+            )
+            _maybe_log_proxy_service_tier_trace(
+                "stream",
+                requested_service_tier=requested_service_tier,
+                actual_service_tier=actual_service_tier,
+            )
+
+    async def _write_request_log(
+        self,
+        *,
+        account_id: str | None,
+        api_key: ApiKeyData | None,
+        request_id: str,
+        model: str | None,
+        latency_ms: int,
+        status: str,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cached_input_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        reasoning_effort: str | None = None,
+        service_tier: str | None = None,
+    ) -> None:
+        with anyio.CancelScope(shield=True):
+            try:
+                async with self._repo_factory() as repos:
+                    await repos.request_logs.add_log(
+                        account_id=account_id,
+                        api_key_id=api_key.id if api_key else None,
+                        request_id=request_id,
+                        model=model or "",
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cached_input_tokens=cached_input_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        reasoning_effort=reasoning_effort,
+                        service_tier=service_tier,
+                        latency_ms=latency_ms,
+                        status=status,
+                        error_code=error_code,
+                        error_message=error_message,
                     )
-                _maybe_log_proxy_service_tier_trace(
-                    "stream",
-                    requested_service_tier=requested_service_tier,
-                    actual_service_tier=actual_service_tier,
+            except Exception:
+                logger.warning(
+                    "Failed to persist request log account_id=%s request_id=%s",
+                    account_id,
+                    request_id,
+                    exc_info=True,
                 )
 
     async def _refresh_usage(self, repos: ProxyRepositories, accounts: list[Account]) -> None:
         latest_usage = await repos.usage.latest_by_account(window="primary")
-        updater = UsageUpdater(repos.usage, repos.accounts)
+        updater = UsageUpdater(repos.usage, repos.accounts, repos.additional_usage)
         await updater.refresh_accounts(accounts, latest_usage)
 
     async def _latest_usage_rows(
@@ -783,6 +941,130 @@ class ProxyService:
         latest = await repos.usage.latest_by_account()
         return [entry for entry in latest.values() if entry.account_id in account_map]
 
+    async def _build_additional_rate_limits(
+        self,
+        repos: ProxyRepositories,
+        account_map: dict[str, Account],
+        now_epoch: int,
+    ) -> list[AdditionalRateLimitData]:
+        """Build additional rate limit entries from AdditionalUsageRepository."""
+        if not account_map:
+            return []
+
+        limit_names = await repos.additional_usage.list_limit_names(account_ids=list(account_map.keys()))
+        additional_limits = []
+
+        for limit_name in limit_names:
+            # Fetch latest entries for this limit across all accounts
+            latest_entries = await repos.additional_usage.latest_by_account(
+                limit_name=limit_name,
+                window="primary",
+            )
+            latest_secondary = await repos.additional_usage.latest_by_account(
+                limit_name=limit_name,
+                window="secondary",
+            )
+
+            # Filter to selected accounts
+            filtered_entries = {
+                account_id: entry for account_id, entry in latest_entries.items() if account_id in account_map
+            }
+            filtered_secondary = {
+                account_id: entry for account_id, entry in latest_secondary.items() if account_id in account_map
+            }
+
+            if not filtered_entries and not filtered_secondary:
+                continue
+
+            first_entry = (
+                next(iter(filtered_entries.values())) if filtered_entries else next(iter(filtered_secondary.values()))
+            )
+            metered_feature = first_entry.metered_feature
+
+            window_snapshot = None
+            avg_used_percent = None
+            if filtered_entries:
+                used_percents = [
+                    entry.used_percent for entry in filtered_entries.values() if entry.used_percent is not None
+                ]
+                if used_percents:
+                    avg_used_percent = sum(used_percents) / len(used_percents)
+                    window_minutes_values = [e.window_minutes for e in filtered_entries.values() if e.window_minutes]
+                    reset_at_values = [e.reset_at for e in filtered_entries.values() if e.reset_at is not None]
+
+                    if window_minutes_values and reset_at_values:
+                        window_minutes = max(window_minutes_values)
+                        limit_window_seconds = int(window_minutes * 60)
+                        reset_at = int(min(reset_at_values))
+                        reset_after_seconds = max(0, reset_at - now_epoch)
+
+                        window_snapshot = RateLimitWindowSnapshotData(
+                            used_percent=int(max(0.0, min(100.0, avg_used_percent))),
+                            limit_window_seconds=limit_window_seconds,
+                            reset_after_seconds=reset_after_seconds,
+                            reset_at=reset_at,
+                        )
+                    else:
+                        # Timing metadata absent — still emit used_percent
+                        # so clients retain visibility into quota consumption.
+                        window_snapshot = RateLimitWindowSnapshotData(
+                            used_percent=int(max(0.0, min(100.0, avg_used_percent))),
+                        )
+
+            secondary_window_snapshot = None
+            if filtered_secondary:
+                sec_used_percents = [e.used_percent for e in filtered_secondary.values() if e.used_percent is not None]
+                if sec_used_percents:
+                    sec_avg = sum(sec_used_percents) / len(sec_used_percents)
+                    sec_window_values = [e.window_minutes for e in filtered_secondary.values() if e.window_minutes]
+                    sec_reset_values = [e.reset_at for e in filtered_secondary.values() if e.reset_at is not None]
+
+                    if sec_window_values and sec_reset_values:
+                        sec_window_minutes = max(sec_window_values)
+                        sec_limit_window_seconds = int(sec_window_minutes * 60)
+                        sec_reset_at = int(min(sec_reset_values))
+                        sec_reset_after_seconds = max(0, sec_reset_at - now_epoch)
+                        secondary_window_snapshot = RateLimitWindowSnapshotData(
+                            used_percent=int(max(0.0, min(100.0, sec_avg))),
+                            limit_window_seconds=sec_limit_window_seconds,
+                            reset_after_seconds=sec_reset_after_seconds,
+                            reset_at=sec_reset_at,
+                        )
+                    else:
+                        secondary_window_snapshot = RateLimitWindowSnapshotData(
+                            used_percent=int(max(0.0, min(100.0, sec_avg))),
+                        )
+
+            rate_limit_details = None
+            if avg_used_percent is not None or secondary_window_snapshot is not None:
+                # Per-account availability: an account is available when
+                # neither its primary nor secondary window is exhausted.
+                # Pool is allowed when at least one account can serve.
+                all_account_ids = set(filtered_entries.keys()) | set(filtered_secondary.keys())
+                any_available = False
+                for aid in all_account_ids:
+                    pri_pct = filtered_entries[aid].used_percent if aid in filtered_entries else 0.0
+                    sec_pct = filtered_secondary[aid].used_percent if aid in filtered_secondary else 0.0
+                    if pri_pct < 100.0 and sec_pct < 100.0:
+                        any_available = True
+                        break
+                rate_limit_details = RateLimitStatusDetailsData(
+                    allowed=any_available,
+                    limit_reached=not any_available,
+                    primary_window=window_snapshot,
+                    secondary_window=secondary_window_snapshot,
+                )
+
+            additional_limits.append(
+                AdditionalRateLimitData(
+                    limit_name=limit_name,
+                    metered_feature=metered_feature,
+                    rate_limit=rate_limit_details,
+                )
+            )
+
+        return additional_limits
+
     async def _ensure_fresh(self, account: Account, *, force: bool = False) -> Account:
         async with self._repo_factory() as repos:
             auth_manager = AuthManager(repos.accounts)
@@ -794,9 +1076,18 @@ class ProxyService:
             error.code if error else None,
             error.type if error else None,
         )
-        await self._handle_stream_error(account, _upstream_error_from_openai(error), code)
+        await self._handle_stream_error(
+            account,
+            _upstream_error_from_openai(error),
+            code,
+        )
 
-    async def _handle_stream_error(self, account: Account, error: UpstreamError, code: str) -> None:
+    async def _handle_stream_error(
+        self,
+        account: Account,
+        error: UpstreamError,
+        code: str,
+    ) -> None:
         if code in {"rate_limit_exceeded", "usage_limit_reached"}:
             await self._load_balancer.mark_rate_limit(account, error)
             return
@@ -839,6 +1130,11 @@ def _event_type_from_payload(event: OpenAIEvent | None, payload: dict[str, JsonV
     return None
 
 
+def _routing_strategy(settings: object) -> RoutingStrategy:
+    value = getattr(settings, "routing_strategy", "usage_weighted")
+    return "round_robin" if value == "round_robin" else "usage_weighted"
+
+
 def _should_suppress_text_done_event(
     *,
     event_type: str | None,
@@ -875,11 +1171,7 @@ def _maybe_log_proxy_request_shape(
         return
 
     request_id = get_request_id()
-    prompt_cache_key = getattr(payload, "prompt_cache_key", None)
-    if prompt_cache_key is None and payload.model_extra:
-        extra_value = payload.model_extra.get("prompt_cache_key")
-        if isinstance(extra_value, str):
-            prompt_cache_key = extra_value
+    prompt_cache_key = _prompt_cache_key_from_request_model(payload)
     prompt_cache_key_hash = _hash_identifier(prompt_cache_key) if isinstance(prompt_cache_key, str) else None
     prompt_cache_key_raw = (
         _truncate_identifier(prompt_cache_key)
@@ -998,8 +1290,23 @@ def _interesting_header_keys(headers: Mapping[str, str]) -> list[str]:
     return sorted({key.lower() for key in headers.keys() if key.lower() in allowlist})
 
 
+def _prompt_cache_key_from_request_model(payload: ResponsesRequest | ResponsesCompactRequest) -> str | None:
+    typed_value = getattr(payload, "prompt_cache_key", None)
+    if isinstance(typed_value, str) and typed_value:
+        return typed_value
+    if not payload.model_extra:
+        return None
+    extra_value = payload.model_extra.get("prompt_cache_key")
+    if isinstance(extra_value, str) and extra_value:
+        return extra_value
+    camel_value = payload.model_extra.get("promptCacheKey")
+    if isinstance(camel_value, str) and camel_value:
+        return camel_value
+    return None
+
+
 def _sticky_key_from_payload(payload: ResponsesRequest) -> str | None:
-    value = payload.prompt_cache_key
+    value = _prompt_cache_key_from_request_model(payload)
     if not value:
         return None
     stripped = value.strip()
@@ -1020,21 +1327,20 @@ def _sticky_key_for_responses_request(
     headers: Mapping[str, str],
     *,
     codex_session_affinity: bool,
+    openai_cache_affinity: bool,
     sticky_threads_enabled: bool,
 ) -> str | None:
     if codex_session_affinity:
         session_key = _sticky_key_from_session_header(headers)
         if session_key:
             return session_key
-    if sticky_threads_enabled:
+    if openai_cache_affinity or sticky_threads_enabled:
         return _sticky_key_from_payload(payload)
     return None
 
 
 def _sticky_key_from_compact_payload(payload: ResponsesCompactRequest) -> str | None:
-    if not payload.model_extra:
-        return None
-    value = payload.model_extra.get("prompt_cache_key")
+    value = _prompt_cache_key_from_request_model(payload)
     if not isinstance(value, str):
         return None
     stripped = value.strip()
@@ -1046,12 +1352,15 @@ def _sticky_key_for_compact_request(
     headers: Mapping[str, str],
     *,
     codex_session_affinity: bool,
+    openai_cache_affinity: bool,
     sticky_threads_enabled: bool,
 ) -> tuple[str | None, bool]:
     if codex_session_affinity:
         session_key = _sticky_key_from_session_header(headers)
         if session_key:
             return session_key, False
+    if openai_cache_affinity:
+        return _sticky_key_from_compact_payload(payload), False
     if sticky_threads_enabled:
         return _sticky_key_from_compact_payload(payload), True
     return None, False
