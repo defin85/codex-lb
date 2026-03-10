@@ -11,7 +11,7 @@ import pytest
 
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, UsageHistory
+from app.db.models import Account, AccountStatus, StickySession, UsageHistory
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy.load_balancer import LoadBalancer, RuntimeState
@@ -91,11 +91,15 @@ class StubStickySessionsRepository(StickySessionsRepository):
     async def get_account_id(self, key: str) -> str | None:
         return None
 
-    async def upsert(self, key: str, account_id: str) -> None:
-        return None
+    async def upsert(self, key: str, account_id: str) -> StickySession:
+        return self._build_row(key, account_id)
 
-    async def delete(self, key: str) -> None:
-        return None
+    async def delete(self, key: str) -> bool:
+        return False
+
+    @staticmethod
+    def _build_row(key: str, account_id: str) -> StickySession:
+        return StickySession(key=key, account_id=account_id)
 
 
 class StubRequestLogsRepository(RequestLogsRepository):

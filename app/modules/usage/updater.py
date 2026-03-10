@@ -248,10 +248,7 @@ class UsageUpdater:
         rate_limit = payload.rate_limit
         # Treat both None and empty rate_limit (both windows absent) as
         # additional-only to avoid falling through to window processing.
-        has_windows = rate_limit is not None and (
-            rate_limit.primary_window is not None or rate_limit.secondary_window is not None
-        )
-        if not has_windows:
+        if rate_limit is None or (rate_limit.primary_window is None and rate_limit.secondary_window is None):
             additional_synced = self._additional_usage_repo is not None and payload.additional_rate_limits is not None
             return AccountRefreshResult(usage_written=additional_synced)
 
