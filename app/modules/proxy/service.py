@@ -101,6 +101,7 @@ class ProxyService:
         _maybe_log_proxy_request_payload("compact", payload, headers)
         _maybe_log_proxy_request_shape("compact", payload, headers)
         filtered = filter_inbound_headers(headers)
+        ensure_request_id()
         settings = await get_settings_cache().get()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
         sticky_threads_enabled = settings.sticky_threads_enabled
